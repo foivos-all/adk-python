@@ -92,10 +92,9 @@ def _dereference_schema(schema: dict[str, Any]) -> dict[str, Any]:
     
     # Traverse the schema following the path.
     for part in parts:
-      if isinstance(current, dict):
-        current = current.get(part)
-      else:
+      if not isinstance(current, dict):
         return None
+      current = current.get(part)
       if current is None:
         return None
     
