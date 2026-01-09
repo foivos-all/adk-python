@@ -1861,6 +1861,59 @@ async def test_content_to_message_param_assistant_message():
 
 
 @pytest.mark.asyncio
+async def test_content_to_message_param_user_filters_thought_parts():
+  thought_part = types.Part.from_text(text="internal reasoning")
+  thought_part.thought = True
+  content_part = types.Part.from_text(text="visible content")
+  content = types.Content(role="user", parts=[thought_part, content_part])
+
+  message = await _content_to_message_param(content)
+
+  assert message["role"] == "user"
+  assert message["content"] == "visible content"
+
+
+@pytest.mark.asyncio
+async def test_content_to_message_param_assistant_thought_message():
+  part = types.Part.from_text(text="internal reasoning")
+  part.thought = True
+  content = types.Content(role="assistant", parts=[part])
+
+  message = await _content_to_message_param(content)
+
+  assert message["role"] == "assistant"
+  assert message["content"] is None
+  assert message["reasoning_content"] == "internal reasoning"
+
+
+@pytest.mark.asyncio
+async def test_content_to_message_param_model_thought_message():
+  part = types.Part.from_text(text="internal reasoning")
+  part.thought = True
+  content = types.Content(role="model", parts=[part])
+
+  message = await _content_to_message_param(content)
+
+  assert message["role"] == "assistant"
+  assert message["content"] is None
+  assert message["reasoning_content"] == "internal reasoning"
+
+
+@pytest.mark.asyncio
+async def test_content_to_message_param_assistant_thought_and_content_message():
+  thought_part = types.Part.from_text(text="internal reasoning")
+  thought_part.thought = True
+  content_part = types.Part.from_text(text="visible content")
+  content = types.Content(role="assistant", parts=[thought_part, content_part])
+
+  message = await _content_to_message_param(content)
+
+  assert message["role"] == "assistant"
+  assert message["content"] == "visible content"
+  assert message["reasoning_content"] == "internal reasoning"
+
+
+@pytest.mark.asyncio
 async def test_content_to_message_param_function_call():
   content = types.Content(
       role="assistant",
@@ -2084,6 +2137,38 @@ def test_split_message_content_prefers_existing_structured_calls():
   content, tool_calls = _split_message_content_and_tool_calls(message)
   assert content == "ignored"
   assert tool_calls == [tool_call]
+
+
+@pytest.mark.asyncio
+async def test_get_content_does_not_filter_thought_parts():
+  """Test that _get_content does not drop thought parts.
+
+  Thought filtering is handled by the caller (e.g., _content_to_message_param)
+  to avoid duplicating logic across helpers.
+  """
+  thought_part = types.Part(text="Internal reasoning...", thought=True)
+  regular_part = types.Part.from_text(text="Visible response")
+
+  content = await _get_content([thought_part, regular_part])
+
+  assert content == [
+      {"type": "text", "text": "Internal reasoning..."},
+      {"type": "text", "text": "Visible response"},
+  ]
+
+
+@pytest.mark.asyncio
+async def test_get_content_all_thought_parts():
+  """Test that thought parts convert like regular text parts."""
+  thought_part1 = types.Part(text="First reasoning...", thought=True)
+  thought_part2 = types.Part(text="Second reasoning...", thought=True)
+
+  content = await _get_content([thought_part1, thought_part2])
+
+  assert content == [
+      {"type": "text", "text": "First reasoning..."},
+      {"type": "text", "text": "Second reasoning..."},
+  ]
 
 
 @pytest.mark.asyncio
