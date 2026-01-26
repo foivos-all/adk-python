@@ -355,6 +355,44 @@ class TestDereferenceSchemaCircularRefs:
     result = _dereference_schema(schema)
     assert result is not None
 
+  def test_json_pointer_ref(self):
+    """Test simple JSON Pointer reference."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "a": {"$ref": "#/properties/b"},
+            "b": {"type": "string"},
+        },
+    }
+    result = _dereference_schema(schema)
+    assert result["properties"]["a"]["type"] == "string"
+
+  def test_circular_json_pointer_ref(self):
+    """Test circular JSON Pointer reference."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "a": {"$ref": "#/properties/b"},
+            "b": {"$ref": "#/properties/a"},
+        },
+    }
+    result = _dereference_schema(schema)
+    # Check that it resolves to the placeholder
+    assert "description" in result["properties"]["a"]
+    assert "Circular reference" in result["properties"]["a"]["description"]
+
+  def test_json_pointer_to_array_element(self):
+    """Test JSON Pointer to an array element."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "a": {"$ref": "#/properties/b/0"},
+            "b": [{"type": "string"}],
+        },
+    }
+    result = _dereference_schema(schema)
+    assert result["properties"]["a"]["type"] == "string"
+
   def test_circular_ref_reproducing_issue_3870(self):
     """Reproduce the exact scenario from issue #3870."""
     # This is the type of schema that would cause RecursionError before the fix

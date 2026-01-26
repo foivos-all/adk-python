@@ -121,10 +121,19 @@ def _dereference_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
     # Traverse the schema following the path.
     for part in parts:
-      if not isinstance(current, dict):
-        return None
-      current = current.get(part)
-      if current is None:
+      # Unescape JSON Pointer path parts (~1 -> /, ~0 -> ~)
+      part = part.replace("~1", "/").replace("~0", "~")
+      if isinstance(current, dict):
+        if part not in current:
+          return None
+        current = current[part]
+      elif isinstance(current, list):
+        try:
+          current = current[int(part)]
+        except (ValueError, IndexError):
+          return None
+      else:
+        # Cannot traverse further
         return None
 
     return current
