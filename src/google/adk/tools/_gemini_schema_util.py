@@ -110,7 +110,7 @@ def _dereference_schema(schema: dict[str, Any]) -> dict[str, Any]:
   # Track references currently being resolved to detect circular dependencies.
   resolving = set()
 
-  def _resolve_json_pointer(ref_path: str, root: dict) -> Any:
+  def _resolve_json_pointer(ref_path: str, root: dict[str, Any]) -> Any:
     """Resolves a JSON Pointer reference path."""
     if not ref_path.startswith("#/"):
       return None
