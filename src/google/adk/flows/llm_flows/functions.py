@@ -20,8 +20,8 @@ import asyncio
 import base64
 import binascii
 from concurrent.futures import ThreadPoolExecutor
+import contextvars
 import copy
-import functools
 import inspect
 import logging
 import threading
@@ -31,8 +31,8 @@ from typing import cast
 from typing import Dict
 from typing import Optional
 from typing import TYPE_CHECKING
-import uuid
 
+from google.adk.platform import uuid as platform_uuid
 from google.adk.tools.computer_use.computer_use_tool import ComputerUseTool
 from google.genai import types
 
@@ -42,8 +42,8 @@ from ...auth.auth_tool import AuthConfig
 from ...auth.auth_tool import AuthToolArguments
 from ...events.event import Event
 from ...events.event_actions import EventActions
+from ...telemetry import _instrumentation
 from ...telemetry.tracing import trace_merged_tool_calls
-from ...telemetry.tracing import trace_tool_call
 from ...telemetry.tracing import tracer
 from ...tools.base_tool import BaseTool
 from ...tools.tool_confirmation import ToolConfirmation
@@ -140,29 +140,27 @@ async def _call_tool_in_thread_pool(
   """
   from ...tools.function_tool import FunctionTool
 
+  ctx = contextvars.copy_context()
   loop = asyncio.get_running_loop()
   executor = _get_tool_thread_pool(max_workers)
 
   if _is_sync_tool(tool):
-    # For sync FunctionTool, call the underlying function directly
-    def run_sync_tool():
-      if isinstance(tool, FunctionTool):
+    if isinstance(tool, FunctionTool):
+      # For sync FunctionTool, call the underlying function directly.
+      def run_sync_tool():
         args_to_call = tool._preprocess_args(args)
         signature = inspect.signature(tool.func)
         valid_params = {param for param in signature.parameters}
-        if 'tool_context' in valid_params:
-          args_to_call['tool_context'] = tool_context
+        if tool._context_param_name in valid_params:
+          args_to_call[tool._context_param_name] = tool_context
         args_to_call = {
             k: v for k, v in args_to_call.items() if k in valid_params
         }
         return tool.func(**args_to_call)
-      else:
-        # For other sync tool types, we can't easily run them in thread pool
-        return None
 
-    result = await loop.run_in_executor(executor, run_sync_tool)
-    if result is not None:
-      return result
+      return await loop.run_in_executor(
+          executor, lambda: ctx.run(run_sync_tool)
+      )
   else:
     # For async tools, run them in a new event loop in a background thread.
     # This helps when async functions contain blocking I/O (common user mistake)
@@ -171,14 +169,16 @@ async def _call_tool_in_thread_pool(
       # Create a new event loop for this thread
       return asyncio.run(tool.run_async(args=args, tool_context=tool_context))
 
-    return await loop.run_in_executor(executor, run_async_tool_in_new_loop)
+    return await loop.run_in_executor(
+        executor, lambda: ctx.run(run_async_tool_in_new_loop)
+    )
 
-  # Fall back to normal async execution for non-FunctionTool sync tools
+  # Fall back to normal async execution for non-FunctionTool sync tools.
   return await tool.run_async(args=args, tool_context=tool_context)
 
 
 def generate_client_function_call_id() -> str:
-  return f'{AF_FUNCTION_CALL_ID_PREFIX}{uuid.uuid4()}'
+  return f'{AF_FUNCTION_CALL_ID_PREFIX}{platform_uuid.new_uuid()}'
 
 
 def populate_client_function_call_id(model_response_event: Event) -> None:
@@ -401,7 +401,14 @@ async def handle_function_call_list_async(
   ]
 
   # Wait for all tasks to complete
-  function_response_events = await asyncio.gather(*tasks)
+  try:
+    function_response_events = await asyncio.gather(*tasks)
+  except Exception:
+    for t in tasks:
+      if not t.done():
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    raise
 
   # Filter out None results
   function_response_events = [
@@ -585,17 +592,11 @@ async def _execute_single_function_call_async(
     )
     return function_response_event
 
-  with tracer.start_as_current_span(f'execute_tool {tool.name}'):
-    function_response_event = None
-    try:
-      function_response_event = await _run_with_trace()
-      return function_response_event
-    finally:
-      trace_tool_call(
-          tool=tool,
-          args=function_args,
-          function_response_event=function_response_event,
-      )
+  async with _instrumentation.record_tool_execution(
+      tool, agent, function_args
+  ) as tel_ctx:
+    tel_ctx.function_response_event = await _run_with_trace()
+    return tel_ctx.function_response_event
 
 
 async def handle_function_calls_live(
@@ -630,7 +631,14 @@ async def handle_function_calls_live(
   ]
 
   # Wait for all tasks to complete
-  function_response_events = await asyncio.gather(*tasks)
+  try:
+    function_response_events = await asyncio.gather(*tasks)
+  except Exception:
+    for t in tasks:
+      if not t.done():
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    raise
 
   # Filter out None results
   function_response_events = [
@@ -730,41 +738,77 @@ async def _execute_single_function_call_live(
     # Make a deep copy to avoid being modified.
     function_response = None
 
-    # Handle before_tool_callbacks - iterate through the canonical callback
-    # list
-    for callback in agent.canonical_before_tool_callbacks:
-      function_response = callback(
-          tool=tool, args=function_args, tool_context=tool_context
-      )
-      if inspect.isawaitable(function_response):
-        function_response = await function_response
-      if function_response:
-        break
+    # Step 1: Check if plugin before_tool_callback overrides the function
+    # response.
+    function_response = (
+        await invocation_context.plugin_manager.run_before_tool_callback(
+            tool=tool, tool_args=function_args, tool_context=tool_context
+        )
+    )
 
+    # Step 2: If no overrides are provided from the plugins, further run the
+    # canonical callback.
     if function_response is None:
-      function_response = await _process_function_live_helper(
-          tool,
-          tool_context,
-          function_call,
-          function_args,
-          invocation_context,
-          streaming_lock,
-      )
+      for callback in agent.canonical_before_tool_callbacks:
+        function_response = callback(
+            tool=tool, args=function_args, tool_context=tool_context
+        )
+        if inspect.isawaitable(function_response):
+          function_response = await function_response
+        if function_response:
+          break
 
-    # Calls after_tool_callback if it exists.
-    altered_function_response = None
-    for callback in agent.canonical_after_tool_callbacks:
-      altered_function_response = callback(
-          tool=tool,
-          args=function_args,
-          tool_context=tool_context,
-          tool_response=function_response,
-      )
-      if inspect.isawaitable(altered_function_response):
-        altered_function_response = await altered_function_response
-      if altered_function_response:
-        break
+    # Step 3: Otherwise, proceed calling the tool normally.
+    if function_response is None:
+      try:
+        function_response = await _process_function_live_helper(
+            tool,
+            tool_context,
+            function_call,
+            function_args,
+            invocation_context,
+            streaming_lock,
+        )
+      except Exception as tool_error:
+        error_response = await _run_on_tool_error_callbacks(
+            tool=tool,
+            tool_args=function_args,
+            tool_context=tool_context,
+            error=tool_error,
+        )
+        if error_response is not None:
+          function_response = error_response
+        else:
+          raise tool_error
 
+    # Step 4: Check if plugin after_tool_callback overrides the function
+    # response.
+    altered_function_response = (
+        await invocation_context.plugin_manager.run_after_tool_callback(
+            tool=tool,
+            tool_args=function_args,
+            tool_context=tool_context,
+            result=function_response,
+        )
+    )
+
+    # Step 5: If no overrides are provided from the plugins, further run the
+    # canonical after_tool_callbacks.
+    if altered_function_response is None:
+      for callback in agent.canonical_after_tool_callbacks:
+        altered_function_response = callback(
+            tool=tool,
+            args=function_args,
+            tool_context=tool_context,
+            tool_response=function_response,
+        )
+        if inspect.isawaitable(altered_function_response):
+          altered_function_response = await altered_function_response
+        if altered_function_response:
+          break
+
+    # Step 6: If alternative response exists from after_tool_callback, use it
+    # instead of the original function response.
     if altered_function_response is not None:
       function_response = altered_function_response
 
@@ -783,17 +827,11 @@ async def _execute_single_function_call_live(
     )
     return function_response_event
 
-  with tracer.start_as_current_span(f'execute_tool {tool.name}'):
-    function_response_event = None
-    try:
-      function_response_event = await _run_with_trace()
-      return function_response_event
-    finally:
-      trace_tool_call(
-          tool=tool,
-          args=function_args,
-          function_response_event=function_response_event,
-      )
+  async with _instrumentation.record_tool_execution(
+      tool, agent, function_args
+  ) as tel_ctx:
+    tel_ctx.function_response_event = await _run_with_trace()
+    return tel_ctx.function_response_event
 
 
 async def _process_function_live_helper(
@@ -1133,13 +1171,24 @@ def merge_parallel_function_response_events(
 
   # Merge actions from all events
   merged_actions_data: dict[str, Any] = {}
+  aggregated_ui_widgets = []
   for event in function_response_events:
     if event.actions:
+      actions_dict = event.actions.model_dump(exclude_none=True, by_alias=True)
+      ui_widgets = actions_dict.pop(
+          'renderUiWidgets', None
+      ) or actions_dict.pop('render_ui_widgets', None)
+      if ui_widgets:
+        aggregated_ui_widgets.extend(ui_widgets)
+
       # Use `by_alias=True` because it converts the model to a dictionary while respecting field aliases, ensuring that the enum fields are correctly handled without creating a duplicate.
       merged_actions_data = deep_merge_dicts(
           merged_actions_data,
-          event.actions.model_dump(exclude_none=True, by_alias=True),
+          actions_dict,
       )
+
+  if aggregated_ui_widgets:
+    merged_actions_data['renderUiWidgets'] = aggregated_ui_widgets
 
   merged_actions = EventActions.model_validate(merged_actions_data)
 
@@ -1149,7 +1198,7 @@ def merge_parallel_function_response_events(
       author=base_event.author,
       branch=base_event.branch,
       content=types.Content(role='user', parts=merged_parts),
-      actions=merged_actions,  # Optionally merge actions if required
+      actions=merged_actions,  # Aggregated from all parallel events
   )
 
   # Use the base_event as the timestamp

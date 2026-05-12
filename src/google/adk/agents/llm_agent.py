@@ -56,6 +56,8 @@ from ..tools.base_toolset import BaseToolset
 from ..tools.function_tool import FunctionTool
 from ..tools.tool_configs import ToolConfig
 from ..tools.tool_context import ToolContext
+from ..utils._schema_utils import SchemaType
+from ..utils._schema_utils import validate_schema
 from ..utils.context_utils import Aclosing
 from .base_agent import BaseAgent
 from .base_agent import BaseAgentState
@@ -179,7 +181,15 @@ async def _convert_tool_union_to_tools(
     return [FunctionTool(func=tool_union)]
 
   # At this point, tool_union must be a BaseToolset
-  return await tool_union.get_tools_with_prefix(ctx)
+  try:
+    return await tool_union.get_tools_with_prefix(ctx)
+  except Exception as e:
+    logger.warning(
+        'Failed to get tools from toolset %s: %s',
+        type(tool_union).__name__,
+        e,
+    )
+    return []
 
 
 class LlmAgent(BaseAgent):
@@ -318,12 +328,20 @@ class LlmAgent(BaseAgent):
   # Controlled input/output configurations - Start
   input_schema: Optional[type[BaseModel]] = None
   """The input schema when agent is used as a tool."""
-  output_schema: Optional[type[BaseModel]] = None
+  output_schema: Optional[SchemaType] = None
   """The output schema when agent replies.
 
+  Supports all schema types that the underlying Google GenAI API supports:
+    - type[BaseModel]: e.g., MySchema
+    - list[type[BaseModel]]: e.g., list[MySchema]
+    - list[primitive]: e.g., list[str], list[int]
+    - dict: Raw dict schemas
+    - Schema: Google's Schema type
+
   NOTE:
-    When this is set, agent can ONLY reply and CANNOT use any tools, such as
-    function tools, RAGs, agent transfer, etc.
+    The ADK supports using `output_schema` and `tools` together. It works by
+    exposing tools during the thought loop and enforcing structure only on the
+    final output.
   """
   output_key: Optional[str] = None
   """The key in session state to store the output of the agent.
@@ -820,12 +838,23 @@ class LlmAgent(BaseAgent):
           event.author,
       )
       return
-    if (
-        self.output_key
-        and event.is_final_response()
-        and event.content
-        and event.content.parts
-    ):
+
+    if not self.output_key:
+      return
+
+    # Handle text responses
+    if event.is_final_response() and event.content and event.content.parts:
+
+      # Skip if no text parts at all to avoid overwriting state_delta values
+      # already set (e.g. after_tool_callback with skip_summarization
+      # on function_response-only events).
+      has_text_part = any(
+          part.text is not None and not part.thought
+          for part in event.content.parts
+      )
+
+      if not has_text_part:
+        return
 
       result = ''.join(
           part.text
@@ -838,9 +867,7 @@ class LlmAgent(BaseAgent):
         # Do not attempt to parse it as JSON.
         if not result.strip():
           return
-        result = self.output_schema.model_validate_json(result).model_dump(
-            exclude_none=True
-        )
+        result = validate_schema(self.output_schema, result)
       event.actions.state_delta[self.output_key] = result
 
   @model_validator(mode='after')

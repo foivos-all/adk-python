@@ -15,9 +15,10 @@
 from __future__ import annotations
 
 from typing import Any
+from typing import cast
 from typing import Optional
-import uuid
 
+from google.adk.platform import uuid as platform_uuid
 from google.genai import types
 from pydantic import BaseModel
 from pydantic import ConfigDict
@@ -27,6 +28,7 @@ from pydantic import PrivateAttr
 from ..apps.app import EventsCompactionConfig
 from ..apps.app import ResumabilityConfig
 from ..artifacts.base_artifact_service import BaseArtifactService
+from ..auth.auth_credential import AuthCredential
 from ..auth.credential_service.base_credential_service import BaseCredentialService
 from ..events.event import Event
 from ..memory.base_memory_service import BaseMemoryService
@@ -212,6 +214,9 @@ class InvocationContext(BaseModel):
 
   canonical_tools_cache: Optional[list[BaseTool]] = None
   """The cache of canonical tools for this invocation."""
+
+  credential_by_key: dict[str, AuthCredential] = Field(default_factory=dict)
+  """The resolved credentials for this invocation, keyed by credential_key."""
 
   _invocation_cost_manager: _InvocationCostManager = PrivateAttr(
       default_factory=_InvocationCostManager
@@ -413,4 +418,4 @@ class InvocationContext(BaseModel):
 
 
 def new_invocation_context_id() -> str:
-  return "e-" + str(uuid.uuid4())
+  return "e-" + cast(str, platform_uuid.new_uuid())

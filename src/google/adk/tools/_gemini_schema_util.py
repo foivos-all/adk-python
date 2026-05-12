@@ -107,8 +107,6 @@ def _dereference_schema(schema: dict[str, Any]) -> dict[str, Any]:
   """Resolves $ref pointers in a JSON schema."""
 
   defs = schema.get("$defs", {})
-  # Track references currently being resolved to detect circular dependencies.
-  resolving = set()
 
   def _resolve_json_pointer(ref_path: str, root: dict[str, Any]) -> Any:
     """Resolves a JSON Pointer reference path."""
@@ -138,25 +136,20 @@ def _dereference_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
     return current
 
-  def _resolve_refs(sub_schema: Any, path: str = "#") -> Any:
+  def _resolve_refs(sub_schema: Any, path_refs: frozenset[str]) -> Any:
     if isinstance(sub_schema, dict):
       if "$ref" in sub_schema:
-        ref = sub_schema["$ref"]
+        ref_uri = sub_schema["$ref"]
+        ref_key = ref_uri.split("/")[-1]
 
-        # Detect circular references by checking if we're already resolving
-        # this reference in the current call stack.
-        if ref in resolving:
-          # Return a placeholder schema to break the cycle.
+        if ref_uri in path_refs:
           return {
               "type": "object",
-              "description": f"Circular reference to {ref}",
+              "description": f"Circular ref to {ref_key}",
           }
 
-        # Mark this reference as being resolved.
-        resolving.add(ref)
+        new_path = path_refs | {ref_uri}
 
-        # Try to resolve as a $defs-style reference first.
-        ref_key = ref.split("/")[-1]
         if ref_key in defs:
           # Found the reference, replace it with the definition.
           resolved = defs[ref_key].copy()
@@ -165,43 +158,34 @@ def _dereference_schema(schema: dict[str, Any]) -> dict[str, Any]:
           del sub_schema_copy["$ref"]
           resolved.update(sub_schema_copy)
           # Recursively resolve refs in the newly inserted part.
-          result = _resolve_refs(resolved, ref)
-          # Done resolving this reference, remove from tracking set.
-          resolving.discard(ref)
-          return result
+          return _resolve_refs(resolved, new_path)
 
         # Try to resolve as a JSON Pointer reference.
-        resolved = _resolve_json_pointer(ref, schema)
+        resolved = _resolve_json_pointer(ref_uri, schema)
         if resolved is not None:
           # Copy the resolved schema to avoid modifying the original.
           resolved_copy = (
               resolved.copy() if isinstance(resolved, dict) else resolved
           )
           # Recursively resolve refs in the resolved schema.
-          result = _resolve_refs(resolved_copy, ref)
-          resolving.discard(ref)
-          return result
+          return _resolve_refs(resolved_copy, new_path)
 
-        # Reference not found in either $defs or as a JSON Pointer, return as is.
-        resolving.discard(ref)
+        # Reference not found, return as is.
         return sub_schema
       else:
         # No $ref, so traverse deeper into the dictionary.
         return {
-            key: _resolve_refs(value, f"{path}/{key}")
+            key: _resolve_refs(value, path_refs)
             for key, value in sub_schema.items()
         }
     elif isinstance(sub_schema, list):
       # Traverse into lists.
-      return [
-          _resolve_refs(item, f"{path}[{i}]")
-          for i, item in enumerate(sub_schema)
-      ]
+      return [_resolve_refs(item, path_refs) for item in sub_schema]
     else:
       # Not a dict or list, return as is.
       return sub_schema
 
-  dereferenced_schema = _resolve_refs(schema)
+  dereferenced_schema = _resolve_refs(schema, frozenset())
   # Remove the definitions block after resolving.
   if "$defs" in dereferenced_schema:
     del dereferenced_schema["$defs"]
