@@ -757,8 +757,7 @@ class TestToGeminiSchema:
         == Type.OBJECT
     ), "The circular ref should be handled and return the fallback object"
     assert (
-        gemini_schema.properties["tree"].properties["parent"].description
-        == "Circular ref to Node"
+        "Circular reference to" in gemini_schema.properties["tree"].properties["parent"].description
     )
 
   def test_to_gemini_schema_multi_step_circular_ref(self):

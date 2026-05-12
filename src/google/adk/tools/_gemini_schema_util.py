@@ -145,7 +145,7 @@ def _dereference_schema(schema: dict[str, Any]) -> dict[str, Any]:
         if ref_uri in path_refs:
           return {
               "type": "object",
-              "description": f"Circular ref to {ref_key}",
+              "description": f"Circular reference to {ref_uri}",
           }
 
         new_path = path_refs | {ref_uri}
